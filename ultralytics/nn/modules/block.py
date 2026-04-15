@@ -2122,38 +2122,48 @@ class DualPathSKBlock(nn.Module):
         p2 = self.path2(x)
         return self.fuse(torch.cat((p1, p2), dim=1))
 
-class CASK(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.gap, self.gmp = nn.AdaptiveAvgPool2d(1), nn.AdaptiveMaxPool2d(1)
-        self.conv1d = nn.Conv1d(2, 2, kernel_size=3, padding=1, bias=False)
-        self.softmax = nn.Softmax(dim=1)
-    def forward(self, x1, x2):
-        f = torch.cat([self.gap(x1+x2).view(x1.size(0), 1, -1), self.gmp(x1+x2).view(x1.size(0), 1, -1)], 1)
-        a = self.softmax(self.conv1d(f)).view(x1.size(0), 2, -1, 1, 1)
-        return x1 * a[:, 0] + x2 * a[:, 1]
+class EMA(nn.Module):
+    def __init__(self, channels, factor=32):
+        super(EMA, self).__init__()
+        self.groups = factor
+        assert channels // self.groups > 0
+        self.softmax = nn.Softmax(dim=-1)
+        self.agp = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(channels // self.groups, channels // self.groups)
+        self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
+        self.conv3x3 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
 
-class SASK(nn.Module):
-    def __init__(self, c):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, 7, 1, 3, bias=False)
-    def forward(self, x1, x2):
-        f = torch.cat([torch.mean(x1+x2, 1, True), torch.max(x1+x2, 1, True)[0]], 1)
-        a = torch.sigmoid(self.conv(f))
-        return x1 * a + x2 * (1 - a)
+    def forward(self, x):
+        b, c, h, w = x.size()
+        group_x = x.view(b * self.groups, -1, h, w)  # b*g, c//g, h, w
+        x_h = self.pool_h(group_x)
+        x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        hw_avg = torch.cat([x_h, x_w], dim=2)
+        group_mag_conv = self.conv1x1(hw_avg)
+        h_sig, w_sig = torch.split(group_mag_conv, [h, w], dim=2)
+        group_x = group_x * h_sig.sigmoid() * w_sig.permute(0, 1, 3, 2).sigmoid()
+        
+        x_channels_wise = self.agp(group_x)
+        x_spatial_wise = self.conv3x3(group_x)
+        weights = self.softmax((x_channels_wise * x_spatial_wise).view(b * self.groups, -1, h * w))
+        out = (weights.view(b * self.groups, -1, h, w) * group_x).view(b, c, h, w)
+        return out
 
-class C2f_DualSK(nn.Module):
+class C2f_EMA(nn.Module):
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
         super().__init__()
         self.c = int(c2 * e)
-        self.cv1 = nn.Sequential(nn.Conv2d(c1, 2*self.c, 1, 1), nn.BatchNorm2d(2*self.c), nn.SiLU())
-        self.msk1, self.msk2 = nn.Conv2d(self.c, self.c, 5, 1, 2, groups=self.c), nn.Conv2d(self.c, self.c, 7, 1, 3, groups=self.c)
-        self.sask, self.cask = SASK(self.c), CASK(self.c)
-        self.cv2 = nn.Sequential(nn.Conv2d(3*self.c, c2, 1, 1), nn.BatchNorm2d(c2), nn.SiLU())
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0) for _ in range(n))
+        self.ema = EMA(c2)
+
     def forward(self, x):
-        x1, x2 = self.cv1(x).chunk(2, 1)
-        m1, m2 = self.msk1(x1), self.msk2(x2)
-        return self.cv2(torch.cat([x1+x2, self.sask(m1, m2), self.cask(m1, m2)], 1))
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.ema(self.cv2(torch.cat(y, 1)))
 # ==========================================
 # KẾT THÚC MODULE DUAL-SK
 # ==========================================

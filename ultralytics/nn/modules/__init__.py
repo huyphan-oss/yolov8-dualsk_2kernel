@@ -38,7 +38,8 @@ from .block import (
     Bottleneck,
     BottleneckCSP,
     C2f,
-    C2f_DualSK,
+    EMA,
+    C2f_EMA,
     C2fAttn,
     C2fCIB,
     C2fPSA,
@@ -188,4 +189,6 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "EMA",
+    "C2f_EMA",
 )
