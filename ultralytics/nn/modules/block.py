@@ -2122,54 +2122,48 @@ class DualPathSKBlock(nn.Module):
         p2 = self.path2(x)
         return self.fuse(torch.cat((p1, p2), dim=1))
 
-# --- COPY VÀO CUỐI FILE block.py ---
-class SpatialGate(nn.Module):
-    def __init__(self):
+class DualPathConv(nn.Module):
+    """Tối ưu Precision bằng 2 nhánh 3x3 (D1, D2) và lọc kênh thông minh"""
+    def __init__(self, features):
         super().__init__()
-        self.cv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        # Nhánh 1: Chi tiết vết bệnh (Dilation=1)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(features, features, 3, padding=1, dilation=1, groups=features, bias=False),
+            nn.BatchNorm2d(features),
+            nn.SiLU()
+        )
+        # Nhánh 2: Ngữ cảnh để giảm báo động giả (Dilation=2)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(features, features, 3, padding=2, dilation=2, groups=features, bias=False),
+            nn.BatchNorm2d(features),
+            nn.SiLU()
+        )
+        # Bộ lọc Precision: Giúp mô hình chọn đặc trưng tin cậy nhất
+        self.filter = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(features, features // 4, 1, bias=False),
+            nn.SiLU(),
+            nn.Conv2d(features // 4, features, 1, bias=False),
+            nn.Sigmoid()
+        )
+        self.proj = nn.Conv2d(features, features, 1, bias=False)
 
     def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        out = torch.cat([avg_out, max_out], dim=1)
-        return x * self.sigmoid(self.cv(out))
-
-class SKConv_Precision(nn.Module):
-    def __init__(self, features, r=4, L=32):
-        super().__init__()
-        d = max(int(features / r), L)
-        self.M = 2
-        self.convs = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(features, features, 3, padding=1+i, dilation=1+i, groups=features, bias=False),
-                          nn.BatchNorm2d(features), nn.SiLU()) for i in range(self.M)
-        ])
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.gmp = nn.AdaptiveMaxPool2d(1)
-        self.fc = nn.Sequential(nn.Conv2d(features, d, 1, bias=False), nn.BatchNorm2d(d), nn.SiLU())
-        self.fcs = nn.ModuleList([nn.Conv2d(d, features, 1) for _ in range(self.M)])
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x):
-        feats = torch.stack([conv(x) for conv in self.convs], dim=1)
-        fea_sum = torch.sum(feats, dim=1)
-        fea_z = self.fc(self.gap(fea_sum) + self.gmp(fea_sum))
-        attention = self.softmax(torch.stack([fc(fea_z) for fc in self.fcs], dim=1))
-        return torch.sum(feats * attention, dim=1)
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        combined = x1 + x2
+        return self.proj(combined * self.filter(combined))
 
 class C2f_DualSK(nn.Module):
+    """Cấu trúc C2f nâng cấp (Giữ tên cũ để không phải sửa tasks.py)"""
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
         super().__init__()
         self.c = int(c2 * e)
         self.cv1 = nn.Sequential(nn.Conv2d(c1, 2 * self.c, 1, 1), nn.BatchNorm2d(2 * self.c), nn.SiLU())
         self.cv2 = nn.Sequential(nn.Conv2d((2 + n) * self.c, c2, 1, 1), nn.BatchNorm2d(c2), nn.SiLU())
-        self.m = nn.ModuleList(SKConv_Precision(self.c) for _ in range(n))
-        self.sa = SpatialGate()
+        self.m = nn.ModuleList(DualPathConv(self.c) for _ in range(n))
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
-        return self.sa(self.cv2(torch.cat(y, 1)))
-# ==========================================
-# KẾT THÚC MODULE DUAL-SK
-# ==========================================
+        return self.cv2(torch.cat(y, 1))
