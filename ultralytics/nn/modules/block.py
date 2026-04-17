@@ -2073,73 +2073,24 @@ class RealNVP(nn.Module):
 import torch
 import torch.nn as nn
 
-class SKConv(nn.Module):
-    """Selective Kernel Convolution - Tự động điều chỉnh Receptive Field"""
-    def __init__(self, c1, M=2, r=16, L=32):
-        super().__init__()
-        d = max(int(c1 / r), L)
-        self.M = M
-        self.c1 = c1
-        
-        self.convs = nn.ModuleList([
-            Conv(c1, c1, k=3, s=1, p=1+i, d=1+i, g=c1) for i in range(M)
-        ])
-        
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Conv2d(c1, d, kernel_size=1, bias=False),
-            nn.BatchNorm2d(d),
-            nn.SiLU()
-        )
-        self.fcs = nn.ModuleList([nn.Conv2d(d, c1, kernel_size=1) for _ in range(M)])
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, x):
-        feats = torch.stack([conv(x) for conv in self.convs], dim=1) 
-        U = torch.sum(feats, dim=1) 
-        S = self.gap(U) 
-        Z = self.fc(S) 
-        
-        attention_vectors = torch.stack([fc(Z) for fc in self.fcs], dim=1) 
-        attention_vectors = self.softmax(attention_vectors)
-        V = torch.sum(feats * attention_vectors, dim=1) 
-        return V
-
-class DualPathSKBlock(nn.Module):
-    """Khối luồng kép: Luồng không gian (Spatial) + Luồng ngữ cảnh (Context)"""
-    def __init__(self, c1, c2):
-        super().__init__()
-        c_ = c2 // 2
-        self.path1 = Conv(c1, c_, k=3)
-        self.path2 = nn.Sequential(
-            Conv(c1, c_, k=1),
-            SKConv(c_)
-        )
-        self.fuse = Conv(c2, c2, k=1)
-
-    def forward(self, x):
-        p1 = self.path1(x)
-        p2 = self.path2(x)
-        return self.fuse(torch.cat((p1, p2), dim=1))
-
-class DualPathConv(nn.Module):
-    """Tối ưu Precision bằng 2 nhánh 3x3 (D1, D2) và lọc kênh thông minh"""
+class LightDualPath(nn.Module):
+    """Cấu trúc Dual-Path siêu nhẹ: Tăng Precision, tối ưu GFLOPs"""
     def __init__(self, features):
         super().__init__()
-        # Nhánh 1: Chi tiết vết bệnh (Dilation=1)
+        # Nhánh 1: Tích chập sâu 3x3 để học đặc trưng không gian (giảm tham số)
         self.conv1 = nn.Sequential(
-            nn.Conv2d(features, features, 3, padding=1, dilation=1, groups=features, bias=False),
+            nn.Conv2d(features, features, 3, padding=1, groups=features, bias=False),
             nn.BatchNorm2d(features),
             nn.SiLU()
         )
-        # Nhánh 2: Ngữ cảnh để giảm báo động giả (Dilation=2)
+        # Nhánh 2: Tích chập 1x1 để soi chi tiết điểm ảnh
         self.conv2 = nn.Sequential(
-            nn.Conv2d(features, features, 3, padding=2, dilation=2, groups=features, bias=False),
+            nn.Conv2d(features, features, 1, bias=False),
             nn.BatchNorm2d(features),
             nn.SiLU()
         )
-        # Bộ lọc Precision: Giúp mô hình chọn đặc trưng tin cậy nhất
-        self.filter = nn.Sequential(
+        # Bộ lọc SE-Attention: Ép mô hình chỉ tập trung vào vùng có vết bệnh
+        self.attn = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(features, features // 4, 1, bias=False),
             nn.SiLU(),
@@ -2149,19 +2100,17 @@ class DualPathConv(nn.Module):
         self.proj = nn.Conv2d(features, features, 1, bias=False)
 
     def forward(self, x):
-        x1 = self.conv1(x)
-        x2 = self.conv2(x)
-        combined = x1 + x2
-        return self.proj(combined * self.filter(combined))
+        out = self.conv1(x) + self.conv2(x)
+        return self.proj(out * self.attn(out))
 
 class C2f_DualSK(nn.Module):
-    """Cấu trúc C2f nâng cấp (Giữ tên cũ để không phải sửa tasks.py)"""
+    """Cấu trúc C2f nâng cấp tích hợp LightDualPath"""
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
         super().__init__()
         self.c = int(c2 * e)
         self.cv1 = nn.Sequential(nn.Conv2d(c1, 2 * self.c, 1, 1), nn.BatchNorm2d(2 * self.c), nn.SiLU())
         self.cv2 = nn.Sequential(nn.Conv2d((2 + n) * self.c, c2, 1, 1), nn.BatchNorm2d(c2), nn.SiLU())
-        self.m = nn.ModuleList(DualPathConv(self.c) for _ in range(n))
+        self.m = nn.ModuleList(LightDualPath(self.c) for _ in range(n))
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
