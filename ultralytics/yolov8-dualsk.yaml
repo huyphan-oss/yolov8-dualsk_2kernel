@@ -1,4 +1,4 @@
-# Các thông số cơ bản cho bài toán lá sắn
+# Các thông số cho bài toán lá sắn - Tối ưu GFLOPs & Precision
 nc: 1  
 names: ['unhealthy']
 
@@ -10,28 +10,28 @@ backbone:
   - [-1, 1, Conv, [128, 3, 2]]     # 1
   - [-1, 3, C2f, [128, True]]      # 2
   - [-1, 1, Conv, [256, 3, 2]]     # 3
-  - [-1, 6, C2f_DualSK, [256, True]] # 4
+  - [-1, 6, C2f, [256, True]]      # 4 (Dùng C2f gốc cho nhẹ)
   - [-1, 1, Conv, [512, 3, 2]]     # 5
-  - [-1, 6, C2f_DualSK, [512, True]] # 6
+  - [-1, 6, C2f, [512, True]]      # 6 (Dùng C2f gốc cho nhẹ)
   - [-1, 1, Conv, [1024, 3, 2]]    # 7
-  - [-1, 3, C2f_DualSK, [1024, True]] # 8
+  - [-1, 3, C2f, [1024, True]]     # 8
   - [-1, 1, SPPF, [1024, 5]]       # 9
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 10
   - [[-1, 6], 1, Concat, [1]]  # 11
-  - [-1, 3, C2f_DualSK, [512]]  # 12
+  - [-1, 3, C2f_DualSK, [512]]  # 12 (Tăng cường Head)
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 13
   - [[-1, 4], 1, Concat, [1]]  # 14
-  - [-1, 3, C2f_DualSK, [256]]  # 15 (Đầu ra cho vật thể NHỎ)
+  - [-1, 3, C2f_DualSK, [256]]  # 15 (Đầu ra vật thể nhỏ)
 
   - [-1, 1, Conv, [256, 3, 2]]  # 16
   - [[-1, 12], 1, Concat, [1]] # 17
-  - [-1, 3, C2f, [512]]         # 18 (Đầu ra cho vật thể VỪA)
+  - [-1, 3, C2f, [512]]         # 18
 
   - [-1, 1, Conv, [512, 3, 2]]  # 19
   - [[-1, 9], 1, Concat, [1]]  # 20
-  - [-1, 3, C2f, [1024]]        # 21 (Đầu ra cho vật thể LỚN)
+  - [-1, 3, C2f, [1024]]        # 21
 
-  - [[15, 18, 21], 1, Detect, [nc]] # 22: Đã sửa từ 24 về 21
+  - [[15, 18, 21], 1, Detect, [nc]] # 22
