@@ -2073,44 +2073,63 @@ class RealNVP(nn.Module):
 import torch
 import torch.nn as nn
 
-class LightDualPath(nn.Module):
-    """Cấu trúc Dual-Path siêu nhẹ: Tăng Precision, tối ưu GFLOPs"""
-    def __init__(self, features):
+class GhostConv(nn.Module):
+    """Ghost Convolution: Giảm GFLOPs bằng cách tạo ra đặc trưng từ các phép toán rẻ tiền [cite: 315, 322]"""
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
         super().__init__()
-        # Nhánh 1: Tích chập sâu 3x3 để học đặc trưng không gian (giảm tham số)
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(features, features, 3, padding=1, groups=features, bias=False),
-            nn.BatchNorm2d(features),
-            nn.SiLU()
+        c_ = c2 // 2  
+        self.cv1 = nn.Sequential(
+            nn.Conv2d(c1, c_, k, s, k // 2, groups=g, bias=False),
+            nn.BatchNorm2d(c_),
+            nn.SiLU() if act is True else nn.Identity()
         )
-        # Nhánh 2: Tích chập 1x1 để soi chi tiết điểm ảnh
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(features, features, 1, bias=False),
-            nn.BatchNorm2d(features),
-            nn.SiLU()
+        # Nhánh tạo "bản sao" đặc trưng (cheap operation) [cite: 322]
+        self.cv2 = nn.Sequential(
+            nn.Conv2d(c_, c_, 3, 1, 1, groups=c_, bias=False), 
+            nn.BatchNorm2d(c_),
+            nn.SiLU() if act is True else nn.Identity()
         )
-        # Bộ lọc SE-Attention: Ép mô hình chỉ tập trung vào vùng có vết bệnh
-        self.attn = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(features, features // 4, 1, bias=False),
-            nn.SiLU(),
-            nn.Conv2d(features // 4, features, 1, bias=False),
-            nn.Sigmoid()
-        )
-        self.proj = nn.Conv2d(features, features, 1, bias=False)
 
     def forward(self, x):
-        out = self.conv1(x) + self.conv2(x)
-        return self.proj(out * self.attn(out))
+        y = self.cv1(x)
+        return torch.cat((y, self.cv2(y)), 1)
+
+class LSSK_Block(nn.Module):
+    """Adaptive Large Scale Selective Kernel: Trái tim của YOLO-DP giúp tăng P [cite: 314, 321]"""
+    def __init__(self, c):
+        super().__init__()
+        # Nhánh nông: k=5, p=2 để lấy thông tin ranh giới [cite: 321]
+        self.m1 = nn.Conv2d(c, c, 5, padding=2, groups=c, bias=False)
+        # Nhánh sâu: k=7, p=9 để lấy ngữ cảnh rộng (sử dụng dilation để bao phủ tốt hơn) [cite: 322]
+        self.m2 = nn.Conv2d(c, c, 7, padding=9, dilation=3, groups=c, bias=False)
+        
+        self.ghost = GhostConv(c, c, k=1)
+        
+        # Spatial Attention: Lọc nhiễu nền để ép Precision [cite: 323, 324, 325]
+        self.attn = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Kết hợp thông tin từ 2 quy mô khác nhau [cite: 329]
+        out = self.ghost(self.m1(x) + self.m2(x))
+        
+        # Tính toán Attention theo kênh [cite: 324, 325]
+        avg_out = torch.mean(out, dim=1, keepdim=True)
+        max_out, _ = torch.max(out, dim=1, keepdim=True)
+        a = self.attn(torch.cat([avg_out, max_out], dim=1)) # [cite: 325, 326]
+        
+        return out * a # Ép mô hình tập trung vào vết bệnh thực sự [cite: 329]
 
 class C2f_DualSK(nn.Module):
-    """Cấu trúc C2f nâng cấp tích hợp LightDualPath"""
+    """Cấu trúc C2f tích hợp LSSK thay cho BottleNeck thông thường"""
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
         super().__init__()
         self.c = int(c2 * e)
-        self.cv1 = nn.Sequential(nn.Conv2d(c1, 2 * self.c, 1, 1), nn.BatchNorm2d(2 * self.c), nn.SiLU())
-        self.cv2 = nn.Sequential(nn.Conv2d((2 + n) * self.c, c2, 1, 1), nn.BatchNorm2d(c2), nn.SiLU())
-        self.m = nn.ModuleList(LightDualPath(self.c) for _ in range(n))
+        self.cv1 = nn.Conv2d(c1, 2 * self.c, 1, 1)
+        self.cv2 = nn.Conv2d((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(LSSK_Block(self.c) for _ in range(n))
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
